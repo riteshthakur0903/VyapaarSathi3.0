@@ -1,8 +1,22 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { UserProfile, Language, Occupation } from '../types';
 import { TRANSLATIONS } from '../i18n/translations';
-import { INDIAN_STATES } from '../data/locations';
-import { MapPin, HelpCircle, ChevronDown, ChevronUp, Check, Navigation, AlertCircle } from 'lucide-react';
+import { INDIAN_STATES, ensureStateAndDistrict } from '../data/locations';
+import {
+  MapPin,
+  HelpCircle,
+  ChevronDown,
+  ChevronUp,
+  Check,
+  Navigation,
+  AlertCircle,
+  Search,
+  Wifi,
+  Compass,
+  CheckCircle2,
+  RefreshCw,
+  Crosshair,
+} from 'lucide-react';
 
 interface ProfileSetupProps {
   profile: UserProfile;
@@ -10,6 +24,17 @@ interface ProfileSetupProps {
   onLanguageChange: (lang: Language) => void;
   onSaveProfile: (updatedProfile: UserProfile) => void;
   onSkipOptional: () => void;
+}
+
+interface PlaceSearchResult {
+  displayName: string;
+  latitude: number;
+  longitude: number;
+  village: string;
+  block: string;
+  district: string;
+  state: string;
+  pincode: string;
 }
 
 export const ProfileSetup: React.FC<ProfileSetupProps> = ({
@@ -25,18 +50,29 @@ export const ProfileSetup: React.FC<ProfileSetupProps> = ({
   const [formData, setFormData] = useState<UserProfile>({ ...profile });
   const [showWhySensitive, setShowWhySensitive] = useState(false);
   const [gpsLoading, setGpsLoading] = useState(false);
-  const [gpsMessage, setGpsMessage] = useState<string | null>(null);
+  const [ipLoading, setIpLoading] = useState(false);
+  const [detectedAddress, setDetectedAddress] = useState<string | null>(null);
+  const [gpsAccuracy, setGpsAccuracy] = useState<number | null>(null);
+  const [gpsMessage, setGpsMessage] = useState<{ type: 'success' | 'info' | 'error'; text: string } | null>(null);
   const [savedSuccess, setSavedSuccess] = useState(false);
 
+  // Search places state
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchResults, setSearchResults] = useState<PlaceSearchResult[]>([]);
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [showSearchResults, setShowSearchResults] = useState(false);
+  const searchTimeoutRef = useRef<any>(null);
+
   // Selected State object
-  const currentStateObj = INDIAN_STATES.find(
-    (s) => s.name.toLowerCase() === (formData.state || '').toLowerCase()
-  ) || INDIAN_STATES[0];
+  const currentStateObj =
+    INDIAN_STATES.find((s) => s.name.toLowerCase() === (formData.state || '').toLowerCase()) ||
+    INDIAN_STATES[0];
 
   // Selected District object
-  const currentDistrictObj = currentStateObj?.districts.find(
-    (d) => d.name.toLowerCase() === (formData.district || '').toLowerCase()
-  ) || currentStateObj?.districts[0];
+  const currentDistrictObj =
+    currentStateObj?.districts.find(
+      (d) => d.name.toLowerCase() === (formData.district || '').toLowerCase()
+    ) || currentStateObj?.districts[0];
 
   const handleStateChange = (stateName: string) => {
     const sObj = INDIAN_STATES.find((s) => s.name === stateName);
@@ -60,41 +96,259 @@ export const ProfileSetup: React.FC<ProfileSetupProps> = ({
     }));
   };
 
-  // Device GPS Location Handler
+  // Process Geocoded Location data and update form
+  const applyDetectedLocation = (loc: {
+    latitude: number;
+    longitude: number;
+    village?: string;
+    block?: string;
+    district?: string;
+    state?: string;
+    pincode?: string;
+    displayName?: string;
+    accuracy?: number;
+  }) => {
+    const { matchedState, matchedDistrict, matchedBlock } = ensureStateAndDistrict(
+      loc.state,
+      loc.district,
+      loc.block
+    );
+
+    const villageName = loc.village || formData.village || '';
+
+    setFormData((prev) => ({
+      ...prev,
+      state: matchedState,
+      district: matchedDistrict,
+      block: matchedBlock,
+      village: villageName,
+      latitude: loc.latitude,
+      longitude: loc.longitude,
+      hasGpsPermission: true,
+    }));
+
+    if (loc.accuracy) {
+      setGpsAccuracy(Math.round(loc.accuracy));
+    }
+
+    setDetectedAddress(
+      [villageName, matchedBlock, matchedDistrict, matchedState].filter(Boolean).join(', ')
+    );
+
+    setGpsMessage({
+      type: 'success',
+      text: `Exact location identified: ${villageName ? `${villageName}, ` : ''}${matchedBlock ? `Tehsil ${matchedBlock}, ` : ''}${matchedDistrict}, ${matchedState}.`,
+    });
+  };
+
+  // High-Accuracy GPS Device Location Handler
   const handleRequestLocation = () => {
     if (!('geolocation' in navigator)) {
-      setGpsMessage('Geolocation is not supported by your browser. Please select manually below.');
+      setGpsMessage({
+        type: 'error',
+        text: 'Geolocation is not supported by your browser. Please use search or select manually below.',
+      });
       return;
     }
 
     setGpsLoading(true);
-    setGpsMessage(null);
+    setGpsMessage({ type: 'info', text: 'Accessing GPS sensors for high-precision coordinates...' });
 
     navigator.geolocation.getCurrentPosition(
-      (position) => {
-        setGpsLoading(false);
-        const { latitude, longitude } = position.coords;
-        setFormData((prev) => ({
-          ...prev,
-          hasGpsPermission: true,
-          latitude,
-          longitude,
-        }));
-        setGpsMessage(
-          `Location detected (${latitude.toFixed(3)}°N, ${longitude.toFixed(3)}°E). District and nearest mandi benchmark mapped.`
-        );
+      async (position) => {
+        const { latitude, longitude, accuracy } = position.coords;
+
+        try {
+          setGpsMessage({
+            type: 'info',
+            text: `GPS coordinates acquired (±${Math.round(accuracy)}m). Identifying village, tehsil and district...`,
+          });
+
+          // Call reverse geocode server endpoint
+          const res = await fetch('/api/location/reverse-geocode', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ latitude, longitude }),
+          });
+
+          if (res.ok) {
+            const data = await res.json();
+            if (data.location) {
+              applyDetectedLocation({
+                ...data.location,
+                accuracy,
+              });
+              setGpsLoading(false);
+              return;
+            }
+          }
+
+          // Fallback direct reverse geocode via client if server error
+          const bdcResp = await fetch(
+            `https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${latitude}&longitude=${longitude}&localityLanguage=en`
+          );
+          if (bdcResp.ok) {
+            const bdcData = await bdcResp.json();
+            const village = bdcData.locality || bdcData.city || '';
+            const state = bdcData.principalSubdivision || '';
+            const adminLevels = bdcData.localityInfo?.administrative || [];
+            const districtObj = adminLevels.find((a: any) => a.order === 4 || a.order === 5) || {};
+            const district = districtObj.name || bdcData.city || '';
+
+            applyDetectedLocation({
+              latitude,
+              longitude,
+              village,
+              district,
+              state,
+              accuracy,
+            });
+            setGpsLoading(false);
+            return;
+          }
+
+          // Fallback if reverse geocode fails: still store exact coordinates
+          setFormData((prev) => ({
+            ...prev,
+            latitude,
+            longitude,
+            hasGpsPermission: true,
+          }));
+          setGpsAccuracy(Math.round(accuracy));
+          setGpsMessage({
+            type: 'success',
+            text: `Exact coordinates detected: ${latitude.toFixed(4)}°N, ${longitude.toFixed(4)}°E (Accuracy: ±${Math.round(accuracy)}m).`,
+          });
+        } catch (err) {
+          console.error('Reverse geocode fetch failed:', err);
+          setFormData((prev) => ({
+            ...prev,
+            latitude,
+            longitude,
+            hasGpsPermission: true,
+          }));
+          setGpsAccuracy(Math.round(accuracy));
+          setGpsMessage({
+            type: 'success',
+            text: `GPS coordinates detected (${latitude.toFixed(4)}°N, ${longitude.toFixed(4)}°E). Please verify your district below.`,
+          });
+        } finally {
+          setGpsLoading(false);
+        }
       },
       (error) => {
         setGpsLoading(false);
         setFormData((prev) => ({ ...prev, hasGpsPermission: false }));
+
         if (error.code === error.PERMISSION_DENIED) {
-          setGpsMessage('Location access was denied. You can easily pick your district and tehsil manually below.');
+          setGpsMessage({
+            type: 'error',
+            text: 'Device location access was blocked or denied in browser settings. You can click "Detect via Network/IP" or search your village below.',
+          });
+        } else if (error.code === error.TIMEOUT) {
+          setGpsMessage({
+            type: 'error',
+            text: 'GPS sensor timed out. Trying network fallback or search below.',
+          });
+          // Auto fallback to IP lookup
+          handleDetectViaIp();
         } else {
-          setGpsMessage('Could not retrieve GPS coordinates. Please select manually.');
+          setGpsMessage({
+            type: 'error',
+            text: 'Could not retrieve satellite GPS fix. Click "Detect via Network/IP" or search below.',
+          });
         }
       },
-      { timeout: 10000, enableHighAccuracy: false }
+      {
+        enableHighAccuracy: true,
+        timeout: 12000,
+        maximumAge: 0,
+      }
     );
+  };
+
+  // Fallback Network IP-based location detection
+  const handleDetectViaIp = async () => {
+    setIpLoading(true);
+    setGpsMessage({ type: 'info', text: 'Detecting regional location via network IP...' });
+
+    try {
+      const res = await fetch('/api/location/ip-lookup');
+      if (res.ok) {
+        const data = await res.json();
+        if (data.location) {
+          applyDetectedLocation(data.location);
+          setIpLoading(false);
+          return;
+        }
+      }
+
+      // Client direct fallback
+      const directIp = await fetch('https://ipapi.co/json/');
+      if (directIp.ok) {
+        const ipData = await directIp.json();
+        applyDetectedLocation({
+          latitude: ipData.latitude,
+          longitude: ipData.longitude,
+          village: ipData.city || '',
+          district: ipData.region || ipData.city || '',
+          state: ipData.region || '',
+          pincode: ipData.postal || '',
+        });
+      }
+    } catch (e) {
+      setGpsMessage({
+        type: 'error',
+        text: 'Network lookup was unavailable. Please search or pick your district manually below.',
+      });
+    } finally {
+      setIpLoading(false);
+    }
+  };
+
+  // Real-time location search handler
+  const handleSearchInputChange = (val: string) => {
+    setSearchQuery(val);
+    if (searchTimeoutRef.current) {
+      clearTimeout(searchTimeoutRef.current);
+    }
+
+    if (val.trim().length < 2) {
+      setSearchResults([]);
+      setShowSearchResults(false);
+      return;
+    }
+
+    setSearchLoading(true);
+    searchTimeoutRef.current = setTimeout(async () => {
+      try {
+        const res = await fetch(`/api/location/search?q=${encodeURIComponent(val)}`);
+        if (res.ok) {
+          const data = await res.json();
+          setSearchResults(data.results || []);
+          setShowSearchResults(true);
+        }
+      } catch (err) {
+        console.error('Search error:', err);
+      } finally {
+        setSearchLoading(false);
+      }
+    }, 350);
+  };
+
+  const handleSelectSearchResult = (result: PlaceSearchResult) => {
+    applyDetectedLocation({
+      latitude: result.latitude,
+      longitude: result.longitude,
+      village: result.village,
+      block: result.block,
+      district: result.district,
+      state: result.state,
+      pincode: result.pincode,
+      displayName: result.displayName,
+    });
+    setSearchQuery('');
+    setShowSearchResults(false);
   };
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -234,7 +488,7 @@ export const ProfileSetup: React.FC<ProfileSetupProps> = ({
           </div>
         </div>
 
-        {/* Section 2: Financial Capacity */}
+        {/* Section 2: Financial Position & Loan Preferences */}
         <div className="space-y-4">
           <h2 className="text-base font-bold text-stone-900 border-b border-stone-100 pb-2">
             2. Financial Position & Loan Preferences
@@ -312,7 +566,7 @@ export const ProfileSetup: React.FC<ProfileSetupProps> = ({
           </div>
         </div>
 
-        {/* Section 3: Location (GPS + Manual Fallback) */}
+        {/* Section 3: Exact Location Detection & Selection */}
         <div className="space-y-4">
           <div className="flex items-center justify-between border-b border-stone-100 pb-2">
             <div>
@@ -321,47 +575,149 @@ export const ProfileSetup: React.FC<ProfileSetupProps> = ({
             </div>
           </div>
 
-          {/* Device GPS Prompt with Clear Permission Ask */}
-          <div className="bg-stone-50 border border-stone-200 rounded-2xl p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
-            <div className="space-y-1">
-              <div className="flex items-center gap-2">
-                <Navigation className="w-4 h-4 text-emerald-800" />
-                <span className="text-xs font-bold text-stone-900">Device Location Request</span>
+          {/* Device GPS & Network Detection Action Box */}
+          <div className="bg-stone-50 border border-stone-200 rounded-2xl p-4 sm:p-5 space-y-4">
+            <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+              <div className="space-y-1">
+                <div className="flex items-center gap-2">
+                  <Crosshair className="w-4 h-4 text-emerald-800 shrink-0" />
+                  <span className="text-xs font-bold text-stone-900">
+                    High-Precision Exact Location Detection
+                  </span>
+                </div>
+                <p className="text-xs text-stone-600">
+                  Detects your exact coordinates and automatically maps your village, tehsil, and district.
+                </p>
               </div>
-              <p className="text-xs text-stone-600">{t.locationPermissionNote}</p>
+
+              {/* Action Buttons: GPS + IP Fallback */}
+              <div className="flex flex-wrap items-center gap-2 shrink-0 w-full sm:w-auto">
+                <button
+                  type="button"
+                  onClick={handleRequestLocation}
+                  disabled={gpsLoading || ipLoading}
+                  className="flex-1 sm:flex-initial px-4 py-2.5 rounded-xl bg-emerald-800 hover:bg-emerald-900 text-white text-xs font-semibold transition-colors flex items-center justify-center gap-2 shadow-xs disabled:opacity-70"
+                >
+                  {gpsLoading ? (
+                    <>
+                      <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                      <span>Detecting GPS...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Compass className="w-3.5 h-3.5" />
+                      <span>Use Device GPS</span>
+                    </>
+                  )}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleDetectViaIp}
+                  disabled={gpsLoading || ipLoading}
+                  className="px-3.5 py-2.5 rounded-xl bg-white border border-stone-300 hover:bg-stone-100 text-stone-700 text-xs font-semibold transition-colors flex items-center justify-center gap-1.5 disabled:opacity-70"
+                  title="Detect via Internet Connection IP"
+                >
+                  {ipLoading ? (
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <Wifi className="w-3.5 h-3.5 text-stone-600" />
+                  )}
+                  <span>Detect via Network</span>
+                </button>
+              </div>
             </div>
 
-            <button
-              type="button"
-              onClick={handleRequestLocation}
-              disabled={gpsLoading}
-              className="px-4 py-2.5 rounded-xl bg-white border border-stone-300 text-stone-800 text-xs font-semibold hover:bg-stone-100 transition-colors flex items-center gap-2 shrink-0"
-            >
-              <MapPin className="w-3.5 h-3.5 text-emerald-800" />
-              <span>{gpsLoading ? t.detectingLocation : t.detectLocationBtn}</span>
-            </button>
+            {/* GPS Feedback Banner */}
+            {gpsMessage && (
+              <div
+                className={`p-3 rounded-xl border text-xs flex items-start gap-2.5 ${
+                  gpsMessage.type === 'success'
+                    ? 'bg-emerald-50 border-emerald-200 text-emerald-950 font-medium'
+                    : gpsMessage.type === 'info'
+                    ? 'bg-blue-50 border-blue-200 text-blue-900'
+                    : 'bg-amber-50 border-amber-200 text-amber-950'
+                }`}
+              >
+                {gpsMessage.type === 'success' ? (
+                  <CheckCircle2 className="w-4 h-4 text-emerald-700 shrink-0 mt-0.5" />
+                ) : (
+                  <AlertCircle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+                )}
+                <div className="flex-1 space-y-0.5">
+                  <p>{gpsMessage.text}</p>
+                  {formData.latitude && formData.longitude && (
+                    <p className="text-[11px] font-mono opacity-80">
+                      Coordinates: {formData.latitude.toFixed(4)}°N, {formData.longitude.toFixed(4)}°E
+                      {gpsAccuracy ? ` (Accuracy: ±${gpsAccuracy}m)` : ''}
+                    </p>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* Search Village / Town Bar */}
+            <div className="pt-2 border-t border-stone-200/80">
+              <label className="block text-xs font-semibold text-stone-700 mb-1.5">
+                Search Any Village, Tehsil, Town or District in India:
+              </label>
+              <div className="relative">
+                <div className="relative flex items-center">
+                  <Search className="w-4 h-4 text-stone-400 absolute left-3.5 pointer-events-none" />
+                  <input
+                    type="text"
+                    value={searchQuery}
+                    onChange={(e) => handleSearchInputChange(e.target.value)}
+                    placeholder="e.g. Baramati, Phaltan, Varanasi, Pipraich, Chomu, Belagavi, Surat..."
+                    className="w-full pl-10 pr-10 py-2.5 rounded-xl border border-stone-300 bg-white text-stone-900 text-xs sm:text-sm focus:outline-none focus:ring-2 focus:ring-emerald-700/20 focus:border-emerald-700"
+                  />
+                  {searchLoading && (
+                    <RefreshCw className="w-4 h-4 text-emerald-700 animate-spin absolute right-3" />
+                  )}
+                </div>
+
+                {/* Search Autocomplete Dropdown */}
+                {showSearchResults && searchResults.length > 0 && (
+                  <div className="absolute top-full left-0 right-0 mt-1 bg-white rounded-xl shadow-lg border border-stone-200 py-1.5 z-30 max-h-56 overflow-y-auto">
+                    {searchResults.map((item, idx) => (
+                      <button
+                        key={idx}
+                        type="button"
+                        onClick={() => handleSelectSearchResult(item)}
+                        className="w-full px-4 py-2 text-left text-xs hover:bg-emerald-50 transition-colors flex items-start gap-2 border-b border-stone-50 last:border-none"
+                      >
+                        <MapPin className="w-3.5 h-3.5 text-emerald-700 shrink-0 mt-0.5" />
+                        <div className="flex-1">
+                          <p className="font-semibold text-stone-900">
+                            {item.village || item.district}
+                            {item.block ? ` (${item.block})` : ''}
+                          </p>
+                          <p className="text-[11px] text-stone-500 truncate">{item.displayName}</p>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
           </div>
 
-          {gpsMessage && (
-            <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-xl text-xs text-emerald-900 flex items-center gap-2">
-              <AlertCircle className="w-4 h-4 text-emerald-700 shrink-0" />
-              <span>{gpsMessage}</span>
-            </div>
-          )}
+          {/* Manual Verified Location Form Fields */}
+          <div className="pt-2 space-y-3">
+            <p className="text-xs font-semibold text-stone-700">
+              Verify or adjust your location details:
+            </p>
 
-          {/* Manual Location Selection */}
-          <div className="pt-2">
-            <p className="text-xs font-semibold text-stone-700 mb-3">{t.orManualLocation}</p>
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
               {/* State */}
               <div>
                 <label className="block text-[11px] font-semibold text-stone-600 mb-1">
-                  {t.stateLabel}
+                  {t.stateLabel} <span className="text-rose-500">*</span>
                 </label>
                 <select
                   value={formData.state}
                   onChange={(e) => handleStateChange(e.target.value)}
-                  className="w-full px-3 py-2 rounded-xl border border-stone-200 text-stone-900 text-xs font-medium bg-white focus:outline-none focus:ring-2 focus:ring-emerald-700/20"
+                  className="w-full px-3 py-2.5 rounded-xl border border-stone-200 text-stone-900 text-xs font-medium bg-white focus:outline-none focus:ring-2 focus:ring-emerald-700/20"
                 >
                   {INDIAN_STATES.map((s) => (
                     <option key={s.name} value={s.name}>
@@ -374,12 +730,12 @@ export const ProfileSetup: React.FC<ProfileSetupProps> = ({
               {/* District */}
               <div>
                 <label className="block text-[11px] font-semibold text-stone-600 mb-1">
-                  {t.districtLabel}
+                  {t.districtLabel} <span className="text-rose-500">*</span>
                 </label>
                 <select
                   value={formData.district}
                   onChange={(e) => handleDistrictChange(e.target.value)}
-                  className="w-full px-3 py-2 rounded-xl border border-stone-200 text-stone-900 text-xs font-medium bg-white focus:outline-none focus:ring-2 focus:ring-emerald-700/20"
+                  className="w-full px-3 py-2.5 rounded-xl border border-stone-200 text-stone-900 text-xs font-medium bg-white focus:outline-none focus:ring-2 focus:ring-emerald-700/20"
                 >
                   {currentStateObj?.districts.map((d) => (
                     <option key={d.name} value={d.name}>
@@ -394,17 +750,13 @@ export const ProfileSetup: React.FC<ProfileSetupProps> = ({
                 <label className="block text-[11px] font-semibold text-stone-600 mb-1">
                   {t.blockLabel}
                 </label>
-                <select
-                  value={formData.block}
+                <input
+                  type="text"
+                  value={formData.block || ''}
                   onChange={(e) => setFormData({ ...formData, block: e.target.value })}
-                  className="w-full px-3 py-2 rounded-xl border border-stone-200 text-stone-900 text-xs font-medium bg-white focus:outline-none focus:ring-2 focus:ring-emerald-700/20"
-                >
-                  {currentDistrictObj?.blocks.map((b) => (
-                    <option key={b} value={b}>
-                      {b}
-                    </option>
-                  ))}
-                </select>
+                  placeholder="e.g. Baramati, Niphad..."
+                  className="w-full px-3 py-2.5 rounded-xl border border-stone-200 text-stone-900 text-xs font-medium focus:outline-none focus:ring-2 focus:ring-emerald-700/20"
+                />
               </div>
 
               {/* Village */}
@@ -414,23 +766,23 @@ export const ProfileSetup: React.FC<ProfileSetupProps> = ({
                 </label>
                 <input
                   type="text"
-                  value={formData.village}
+                  value={formData.village || ''}
                   onChange={(e) => setFormData({ ...formData, village: e.target.value })}
                   placeholder={t.villagePlaceholder}
-                  className="w-full px-3 py-2 rounded-xl border border-stone-200 text-stone-900 text-xs focus:outline-none focus:ring-2 focus:ring-emerald-700/20"
+                  className="w-full px-3 py-2.5 rounded-xl border border-stone-200 text-stone-900 text-xs font-medium focus:outline-none focus:ring-2 focus:ring-emerald-700/20"
                 />
               </div>
             </div>
 
             {/* Mandi & Crops Benchmark Badge */}
             {currentDistrictObj && (
-              <div className="mt-3 p-3 bg-stone-50 rounded-xl border border-stone-200 text-xs text-stone-700 flex flex-wrap items-center gap-x-4 gap-y-1">
+              <div className="mt-3 p-3.5 bg-stone-50 rounded-2xl border border-stone-200 text-xs text-stone-700 flex flex-wrap items-center gap-x-4 gap-y-1">
                 <span>
-                  <strong>Nearest APMC Mandi:</strong> {currentDistrictObj.mandiHub}
+                  <strong>APMC Mandi Hub:</strong> {currentDistrictObj.mandiHub}
                 </span>
-                <span aria-hidden="true">·</span>
+                <span aria-hidden="true" className="text-stone-300">·</span>
                 <span>
-                  <strong>Key Crops:</strong> {currentDistrictObj.primaryCrops.join(', ')}
+                  <strong>Principal Local Crops:</strong> {currentDistrictObj.primaryCrops.join(', ')}
                 </span>
               </div>
             )}

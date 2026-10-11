@@ -114,6 +114,180 @@ Guidelines:
     res.json({ status: 'ok', service: 'VyapaarSathi backend', geminiActive: !!ai });
   });
 
+  // Reverse Geocode Endpoint (Maps GPS Coordinates -> Real Village, Block, District, State)
+  app.post('/api/location/reverse-geocode', async (req, res) => {
+    try {
+      const { latitude, longitude } = req.body;
+      if (!latitude || !longitude) {
+        return res.status(400).json({ error: 'Missing latitude or longitude' });
+      }
+
+      // Query OpenStreetMap Nominatim reverse geocode
+      const nominatimUrl = `https://nominatim.openstreetmap.org/reverse?lat=${latitude}&lon=${longitude}&format=json&addressdetails=1`;
+      const response = await fetch(nominatimUrl, {
+        headers: {
+          'User-Agent': 'VyapaarSathi/1.0 (rural-business-advisory; support@vyapaarsathi.org)',
+          'Accept-Language': 'en,hi',
+        },
+      });
+
+      if (response.ok) {
+        const data: any = await response.json();
+        const address = data.address || {};
+
+        const village =
+          address.village ||
+          address.hamlet ||
+          address.suburb ||
+          address.neighbourhood ||
+          address.town ||
+          address.city_district ||
+          address.city ||
+          '';
+
+        const block =
+          address.subdistrict ||
+          address.county ||
+          address.tehsil ||
+          address.taluka ||
+          address.municipality ||
+          '';
+
+        const district =
+          address.state_district ||
+          address.county ||
+          address.district ||
+          address.city ||
+          '';
+
+        const state = address.state || address.region || '';
+        const pincode = address.postcode || '';
+        const country = address.country || '';
+
+        return res.json({
+          status: 'success',
+          location: {
+            latitude: Number(latitude),
+            longitude: Number(longitude),
+            village,
+            block,
+            district,
+            state,
+            pincode,
+            country,
+            displayName: data.display_name || '',
+          },
+        });
+      }
+
+      // Fallback to BigDataCloud
+      const bdcUrl = `https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${latitude}&longitude=${longitude}&localityLanguage=en`;
+      const bdcResp = await fetch(bdcUrl);
+      if (bdcResp.ok) {
+        const bdcData: any = await bdcResp.json();
+        const village = bdcData.locality || bdcData.city || '';
+        const state = bdcData.principalSubdivision || '';
+        const adminLevels = bdcData.localityInfo?.administrative || [];
+        const districtObj = adminLevels.find((a: any) => a.order === 4 || a.order === 5) || {};
+        const district = districtObj.name || bdcData.city || '';
+
+        return res.json({
+          status: 'success',
+          location: {
+            latitude: Number(latitude),
+            longitude: Number(longitude),
+            village,
+            block: '',
+            district,
+            state,
+            country: bdcData.countryName || 'India',
+            displayName: `${village}, ${district}, ${state}`,
+          },
+        });
+      }
+
+      return res.status(500).json({ error: 'Reverse geocode failed' });
+    } catch (err: any) {
+      console.error('Reverse geocode error:', err);
+      return res.status(500).json({ error: err?.message || 'Geocoding service error' });
+    }
+  });
+
+  // Search Places Endpoint (search villages, towns, districts)
+  app.get('/api/location/search', async (req, res) => {
+    try {
+      const q = req.query.q as string;
+      if (!q || q.length < 2) {
+        return res.json({ results: [] });
+      }
+
+      const searchUrl = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(
+        q
+      )}&format=json&addressdetails=1&countrycodes=in&limit=6`;
+      const response = await fetch(searchUrl, {
+        headers: {
+          'User-Agent': 'VyapaarSathi/1.0 (rural-business-advisory)',
+          'Accept-Language': 'en,hi',
+        },
+      });
+
+      if (response.ok) {
+        const data: any[] = await response.json();
+        const results = data.map((item) => {
+          const addr = item.address || {};
+          return {
+            displayName: item.display_name,
+            latitude: parseFloat(item.lat),
+            longitude: parseFloat(item.lon),
+            village:
+              addr.village ||
+              addr.hamlet ||
+              addr.suburb ||
+              addr.town ||
+              addr.city ||
+              '',
+            block: addr.subdistrict || addr.county || '',
+            district: addr.state_district || addr.county || addr.city || '',
+            state: addr.state || '',
+            pincode: addr.postcode || '',
+          };
+        });
+        return res.json({ results });
+      }
+
+      return res.json({ results: [] });
+    } catch (err) {
+      return res.json({ results: [] });
+    }
+  });
+
+  // IP Location Fallback Endpoint
+  app.get('/api/location/ip-lookup', async (req, res) => {
+    try {
+      const resp = await fetch('https://ipapi.co/json/');
+      if (resp.ok) {
+        const data: any = await resp.json();
+        return res.json({
+          status: 'success',
+          location: {
+            latitude: data.latitude,
+            longitude: data.longitude,
+            village: data.city || '',
+            block: '',
+            district: data.region || data.city || '',
+            state: data.region || '',
+            pincode: data.postal || '',
+            country: data.country_name || 'India',
+            displayName: `${data.city}, ${data.region}, ${data.country_name}`,
+          },
+        });
+      }
+      return res.status(500).json({ error: 'IP lookup failed' });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  });
+
   // Mount Vite or static
   if (process.env.NODE_ENV === 'production') {
     app.use(express.static(path.resolve(__dirname, 'dist')));
